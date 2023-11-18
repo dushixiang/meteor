@@ -2,14 +2,12 @@ package meteor
 
 import (
 	"context"
+	"github.com/dushxiiang/meteor/pkg/logger"
 	"io"
 	"net"
 	"os"
 	"os/signal"
 	"strings"
-	"syscall"
-
-	"github.com/dushxiiang/meteor/pkg/logger"
 
 	"github.com/kardianos/service"
 	"github.com/mitchellh/mapstructure"
@@ -59,6 +57,7 @@ func New(config string) (*Meteor, error) {
 		ctx:    ctx,
 		cancel: cancel,
 		cfg:    cfg,
+		quit:   make(chan struct{}),
 	}
 	return &meteor, nil
 }
@@ -67,6 +66,8 @@ type Meteor struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	cfg    *Config
+
+	quit chan struct{}
 }
 
 func (r *Meteor) Start(s service.Service) error {
@@ -83,14 +84,19 @@ func (r *Meteor) Run() {
 		go proxy.Run(r.ctx)
 	}
 
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt)
-	<-quit
-	r.cancel()
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+	select {
+	case <-interrupt:
+		close(r.quit)
+	case <-r.quit:
+		r.cancel()
+	}
 }
 
 func (r *Meteor) Stop(s service.Service) error {
-	return syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+	close(r.quit)
+	return nil
 }
 
 func (r *Meteor) InitGeoIP() error {
