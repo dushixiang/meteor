@@ -1,4 +1,5 @@
-geoip:
+location:
+  type: geoip
   file: GeoLite2-City.mmdb
 forwarders:
   - protocol: tcp
@@ -8,7 +9,7 @@ forwarders:
       - city: beijing,chengdu
         allowed: true
       - ip: 0.0.0.0/0
-        allowed: false
+        allowed: true
   - protocol: udp
     addr: ":54321"
     to: 127.0.0.1:12345

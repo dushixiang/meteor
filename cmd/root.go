@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/dushxiiang/meteor/meteor"
+	"github.com/dushxiiang/meteor/internal/meteor"
 	"github.com/dushxiiang/meteor/pkg/logger"
 
 	"github.com/spf13/cobra"
@@ -27,7 +27,7 @@ var rootCmd = &cobra.Command{
 		if err != nil {
 			logger.L.Sugar().Fatal(err)
 		}
-		if err := m.InitGeoIP(); err != nil {
+		if err := m.InitLocationService(); err != nil {
 			logger.L.Sugar().Warn(err)
 		}
 		m.Run()
