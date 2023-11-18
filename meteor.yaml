@@ -1,0 +1,27 @@
+geoip:
+  file: GeoLite2-City.mmdb
+forwarders:
+  - protocol: tcp
+    addr: ":54321"
+    to: 127.0.0.1:12345
+    rules:
+      - city: beijing,chengdu
+        allowed: true
+      - ip: 0.0.0.0/0
+        allowed: false
+  - protocol: udp
+    addr: ":54321"
+    to: 127.0.0.1:12345
+#proxies:
+#  - protocol: http
+#    addr: 127.0.0.1:8080
+#    auth: true
+#    accounts:
+#      - username: a
+#        password: b
+#  - protocol: https
+#    addr: 127.0.0.1:80
+#    key: /root/key.pem
+#    cert: /root/cert.pem
+#  - protocol: socks5
+#    addr: 127.0.0.1:1080
