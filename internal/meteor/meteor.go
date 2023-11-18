@@ -2,6 +2,7 @@ package meteor
 
 import (
 	"context"
+	"github.com/dushxiiang/meteor/internal/location"
 	"github.com/dushxiiang/meteor/pkg/logger"
 	"io"
 	"net"
@@ -19,8 +20,14 @@ const Timeout int = 10
 const Version = "v0.1.0"
 
 type Config struct {
-	Forwarders []Forwarder `yaml:"forwarders"`
-	Proxies    []Proxy     `yaml:"proxies"`
+	Forwarders []Forwarder    `yaml:"forwarders"`
+	Proxies    []Proxy        `yaml:"proxies"`
+	Location   LocationConfig `yaml:"location"`
+}
+
+type LocationConfig struct {
+	Type string `yaml:"type"`
+	File string `yaml:"file"`
 }
 
 func readConfig(config string) (cfg *Config, err error) {
@@ -67,7 +74,8 @@ type Meteor struct {
 	cancel context.CancelFunc
 	cfg    *Config
 
-	quit chan struct{}
+	Location location.Location
+	quit     chan struct{}
 }
 
 func (r *Meteor) Start(s service.Service) error {
@@ -76,12 +84,14 @@ func (r *Meteor) Start(s service.Service) error {
 }
 
 func (r *Meteor) Run() {
-	for _, f := range r.cfg.Forwarders {
-		go f.Forward(r.ctx)
+	forwarders := r.cfg.Forwarders
+	for i := range forwarders {
+		go forwarders[i].Forward(r.ctx, r.Location)
 	}
 
-	for _, proxy := range r.cfg.Proxies {
-		go proxy.Run(r.ctx)
+	proxies := r.cfg.Proxies
+	for i := range proxies {
+		go proxies[i].Run(r.ctx)
 	}
 
 	interrupt := make(chan os.Signal, 1)
@@ -99,13 +109,15 @@ func (r *Meteor) Stop(s service.Service) error {
 	return nil
 }
 
-func (r *Meteor) InitGeoIP() error {
-	geoipFile := viper.GetString("geoip.file")
-	if geoipFile == "" {
-		return nil
-	}
-	if err := InitGeoIP(geoipFile); err != nil {
-		return errors.Wrap(err, "error init geoip")
+func (r *Meteor) InitLocationService() error {
+	locationConfig := r.cfg.Location
+	switch locationConfig.Type {
+	case "geoip":
+		ipLocation, err := location.NewGeoIPLocation(locationConfig.File)
+		if err != nil {
+			return err
+		}
+		r.Location = ipLocation
 	}
 	return nil
 }

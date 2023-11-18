@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/dushxiiang/meteor/meteor"
+	"github.com/dushxiiang/meteor/internal/meteor"
 	"github.com/dushxiiang/meteor/pkg/logger"
 
 	"github.com/kardianos/service"
