@@ -15,7 +15,8 @@ vim /etc/meteor/meteor.yaml
 
 配置文件示例：
 ```shell
-geoip:
+location:
+  type: geoip                 # 目前仅支持 geoip
   file: GeoLite2-City.mmdb    # 配置geoip后支持按城市配置规则
 forwarders:
   - protocol: tcp             # 仅支持 tcp 和 udp
@@ -80,10 +81,8 @@ Usage:
 
 Available Commands:
   completion  Generate the autocompletion script for the specified shell
-  forward     Forward the received data to the destination address
   help        Help about any command
   install     Install meteor as a system service
-  proxy       Start a proxy server
   restart     Restart meteor system service
   start       Start meteor system service
   stop        Stop meteor system service
