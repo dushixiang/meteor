@@ -107,7 +107,7 @@ Use "meteor [command] --help" for more information about a command.
 ```
 
 ### Example
-动Debug模式
+启动Debug模式
 ```shell
 meteor install -d
 ```
