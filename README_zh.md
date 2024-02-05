@@ -17,7 +17,7 @@ vim /etc/meteor/meteor.yaml
 ```shell
 location:
   type: geoip                 # 目前仅支持 geoip
-  file: GeoLite2-City.mmdb    # 配置geoip后支持按城市配置规则
+  file: GeoLite2-City.mmdb    # 配置geoip后支持按城市配置规则, 数据库文件需自行下载，然后配置文件地址
 forwarders:
   - protocol: tcp             # 仅支持 tcp 和 udp
     addr: ":54321"            # 本机监听地址
@@ -96,3 +96,22 @@ Flags:
 
 Use "meteor [command] --help" for more information about a command.
 ```
+
+### Example
+动Debug模式
+```shell
+meteor install -d
+```
+查看运行日志
+```shell
+journalctl -u meteor -f
+```
+
+## TODO List
+- 状态统计功能
+  - 连接次数，总数，总共传输数据量， 访问top级IP，拒绝top级IP 等信息统计及展示(命令行)
+- 结构化日志
+  - 连接日志结构化记录，方便统一日志接管
+- 威胁情报接入
+  - 接入
+  - 上传
