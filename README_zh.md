@@ -1,5 +1,5 @@
 # Meteor
-
+> Meteor是一款基于GeoIP的访问规则管理软件, 相比于Iptables更加简单易用。
 ## 使用
 
 **安装**
@@ -98,7 +98,7 @@ Use "meteor [command] --help" for more information about a command.
 ```
 
 ### Example
-动Debug模式
+动态Debug模式
 ```shell
 meteor install -d
 ```
@@ -112,6 +112,7 @@ journalctl -u meteor -f
   - 连接次数，总数，总共传输数据量， 访问top级IP，拒绝top级IP 等信息统计及展示(命令行)
 - 结构化日志
   - 连接日志结构化记录，方便统一日志接管
+  - 日志Elasticsearch桥接
 - 威胁情报接入
   - 接入
   - 上传
