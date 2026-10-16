@@ -2,19 +2,18 @@ package meteor
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
-	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/dushxiiang/meteor/pkg/logger"
-
-	"github.com/armon/go-socks5"
+	"github.com/things-go/go-socks5"
 )
 
 type Proxy struct {
@@ -27,32 +26,31 @@ type Proxy struct {
 }
 
 type Account struct {
-	Username string
-	Password string
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
 }
 
 func (p Proxy) Run(ctx context.Context) {
 	switch p.Protocol {
-	case "http":
-		p.startHttpProxyServer(ctx)
-	case "https":
-		p.startHttpsProxyServer(ctx)
+	case "http", "https":
+		p.startHTTPProxyServer(ctx)
 	case "socks5":
 		p.startSocks5ProxyServer(ctx)
 	}
 }
 
-func (p Proxy) startHttpProxyServer(ctx context.Context) {
-	sugar := logger.L.Sugar()
+func (p Proxy) startHTTPProxyServer(ctx context.Context) {
 	server := &http.Server{
-		Addr: p.Addr,
+		Addr:              preprocessingAddr(p.Addr),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
+		BaseContext:       func(net.Listener) context.Context { return ctx },
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if p.Auth && !p.auth(r) {
 				p.writeBasicUnauthorized(w)
 				return
 			}
-			r.Header.Del("Proxy-Connection")
-			r.Header.Del("Proxy-Authenticate")
 			if r.Method == http.MethodConnect {
 				handleTunneling(w, r)
 			} else {
@@ -61,98 +59,53 @@ func (p Proxy) startHttpProxyServer(ctx context.Context) {
 		}),
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 	}
-
-	sugar.Infof("HTTP proxy server started: %s, with auth enabled: %v", p.Addr, p.Auth)
-
+	done := make(chan struct{})
 	go func() {
-		err := server.ListenAndServe()
+		defer close(done)
+		var err error
+		if p.Protocol == "https" {
+			err = server.ListenAndServeTLS(p.Cert, p.Key)
+		} else {
+			err = server.ListenAndServe()
+		}
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			sugar.Error("shutting down the proxy server", err)
+			slog.Error("proxy server failed", "protocol", p.Protocol, "addr", p.Addr, "error", err)
 		}
 	}()
-
-	<-ctx.Done()
-	if err := server.Shutdown(ctx); err != nil {
-		sugar.Error("error shutdown the proxy server", err)
+	select {
+	case <-done:
+		return
+	case <-ctx.Done():
 	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		_ = server.Close()
+		slog.Error("proxy shutdown failed", "protocol", p.Protocol, "addr", p.Addr, "error", err)
+	}
+	<-done
 }
 
 func (p Proxy) writeBasicUnauthorized(w http.ResponseWriter) {
+	w.Header().Set("Proxy-Authenticate", `Basic realm="Restricted"`)
 	w.WriteHeader(http.StatusProxyAuthRequired)
-	//w.Header().Set("Proxy-Connection", "close")
-	w.Header().Set("Proxy-Authenticate", "Basic realm=Restricted")
 	_, _ = fmt.Fprint(w, http.StatusText(http.StatusProxyAuthRequired))
 }
 
 func (p Proxy) auth(r *http.Request) bool {
-	// 获取代理认证信息
-	authHeader := r.Header.Get("Proxy-Authorization")
-	if authHeader == "" {
-		return false
-	}
-
-	// 解码认证信息
-	auth := authHeader[len("Basic "):]
-	decodedAuth, err := base64.StdEncoding.DecodeString(auth)
-	if err != nil {
-		return false
-	}
-
-	// 检查用户名和密码
-	parts := strings.SplitN(string(decodedAuth), ":", 2)
-	username := parts[0]
-	password := parts[1]
-
-	var passed = false
-	for _, account := range p.Accounts {
-		if account.Username == username && account.Password == password {
-			passed = true
-			break
-		}
-	}
-	return passed
+	credentials := &http.Request{Header: make(http.Header)}
+	credentials.Header.Set("Authorization", r.Header.Get("Proxy-Authorization"))
+	username, password, ok := credentials.BasicAuth()
+	return ok && p.Valid(username, password, "")
 }
 
-func (p Proxy) startHttpsProxyServer(ctx context.Context) {
-	sugar := logger.L.Sugar()
-	server := &http.Server{
-		Addr: p.Addr,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if p.Auth && !p.auth(r) {
-				p.writeBasicUnauthorized(w)
-				return
-			}
-			if r.Method == http.MethodConnect {
-				handleTunneling(w, r)
-			} else {
-				handleHttp(w, r)
-			}
-		}),
-		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
-	}
-
-	sugar.Infof("HTTPS proxy server started: %s, with auth enabled: %v", p.Addr, p.Auth)
-
-	go func() {
-		err := server.ListenAndServeTLS(p.Cert, p.Key)
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			sugar.Error("shutting down the proxy server", err)
-		}
-	}()
-
-	<-ctx.Done()
-	if err := server.Shutdown(ctx); err != nil {
-		sugar.Error("error shutdown the proxy server", err)
-	}
-}
-
-func (p Proxy) Valid(username, password string) bool {
+func (p Proxy) Valid(username, password, _ string) bool {
 	if !p.Auth {
 		return true
 	}
 	var passed = false
 	for _, account := range p.Accounts {
-		if account.Username == username && account.Password == password {
+		if subtle.ConstantTimeCompare([]byte(account.Username), []byte(username)) == 1 && subtle.ConstantTimeCompare([]byte(account.Password), []byte(password)) == 1 {
 			passed = true
 			break
 		}
@@ -161,67 +114,135 @@ func (p Proxy) Valid(username, password string) bool {
 }
 
 func (p Proxy) startSocks5ProxyServer(ctx context.Context) {
-	sugar := logger.L.Sugar()
 
-	conf := &socks5.Config{
-		Credentials: p,
+	options := []socks5.Option{socks5.WithRule(&socks5.PermitCommand{EnableConnect: true}), socks5.WithDial(func(_ context.Context, network, addr string) (net.Conn, error) {
+		return (&net.Dialer{Timeout: time.Duration(Timeout) * time.Second}).DialContext(ctx, network, addr)
+	})}
+	if p.Auth {
+		options = append(options, socks5.WithCredential(p))
 	}
-
-	// never return err
-	server, _ := socks5.New(conf)
+	server := socks5.NewServer(options...)
 
 	// 指定监听地址和端口
 	addr := preprocessingAddr(p.Addr)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		sugar.Error("error listening on address", err)
+		slog.Error("SOCKS5 listen failed", "addr", addr, "error", err)
 		return
 	}
 
-	sugar.Infof("Socks5 proxy server started: %s, with auth enabled: %v", addr, p.Auth)
-	go func() {
-		if err := server.Serve(ln); err != nil {
-			sugar.Warnf("Socks5 proxy server stoped: %s", err.Error())
+	defer ln.Close()
+	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
+	defer stop()
+	var workers sync.WaitGroup
+	defer workers.Wait()
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() == nil {
+				slog.Error("SOCKS5 accept failed", "addr", addr, "error", err)
+			}
 			return
 		}
-	}()
-	<-ctx.Done()
-	_ = ln.Close()
+		workers.Go(func() {
+			defer conn.Close()
+			stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+			defer stop()
+			if err := server.ServeConn(conn); err != nil && ctx.Err() == nil {
+				slog.Debug("SOCKS5 client failed", "remote", conn.RemoteAddr(), "error", err)
+			}
+		})
+	}
+
 }
 
 func handleTunneling(w http.ResponseWriter, r *http.Request) {
-	remoteConn, err := net.DialTimeout("tcp", r.Host, time.Duration(Timeout)*time.Second)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijack not supported", http.StatusInternalServerError)
 		return
 	}
-	centralConn, _, err := hijacker.Hijack()
+	dialer := &net.Dialer{Timeout: time.Duration(Timeout) * time.Second, KeepAlive: 30 * time.Second}
+	remote, err := dialer.DialContext(r.Context(), "tcp", r.Host)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, "upstream connection failed", http.StatusBadGateway)
+		return
 	}
+	defer remote.Close()
+	client, buffered, err := hijacker.Hijack()
+	if err != nil {
+		return
+	}
+	defer client.Close()
+	if _, err := buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		return
+	}
+	if err := buffered.Flush(); err != nil {
+		return
+	}
+	// The HTTP parser may already have read tunnel bytes from the client.
+	stop := context.AfterFunc(r.Context(), func() { _ = client.Close(); _ = remote.Close() })
+	defer stop()
+	relay(client, remote, buffered)
 
-	go mutualCopyIO(remoteConn, centralConn)
+}
+
+var proxyTransport = func() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DisableCompression = true
+	transport.ResponseHeaderTimeout = 30 * time.Second
+	transport.MaxIdleConns = 100
+	transport.MaxIdleConnsPerHost = 10
+	return transport
+}()
+
+func stripHopHeaders(header http.Header) {
+	for _, value := range header.Values("Connection") {
+		for _, name := range strings.Split(value, ",") {
+			header.Del(strings.TrimSpace(name))
+		}
+	}
+	for _, name := range []string{"Connection", "Proxy-Connection", "Proxy-Authorization", "Proxy-Authenticate", "Keep-Alive", "TE", "Trailer", "Transfer-Encoding", "Upgrade"} {
+		header.Del(name)
+	}
 }
 
 func handleHttp(w http.ResponseWriter, req *http.Request) {
-	resp, err := http.DefaultTransport.RoundTrip(req)
+	if req.URL.Host == "" || (req.URL.Scheme != "http" && req.URL.Scheme != "https") {
+		http.Error(w, "absolute HTTP URL required", http.StatusBadRequest)
+		return
+	}
+	out := req.Clone(req.Context())
+	out.RequestURI = ""
+	stripHopHeaders(out.Header)
+	resp, err := proxyTransport.RoundTrip(out)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
-
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
+	stripHopHeaders(resp.Header)
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	// Flush each upstream chunk so small SSE events are not held in buffers.
+	buffer := make([]byte, 32*1024)
+	for {
+		n, err := resp.Body.Read(buffer)
+		if n > 0 {
+			if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
+				return
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
 }

@@ -109,6 +109,8 @@ View Running Logs
 journalctl -u meteor -f
 ```
 
+Logs use the Go standard library `log/slog` package with a structured text handler writing to standard error. The application does not create or rotate log files. Enable debug logs with `-d`. On Linux, systemd collects stdout and stderr in the journal by default: use `journalctl -u meteor -f` to follow logs or `journalctl -u meteor -b` to inspect logs from the current boot. Journald manages retention and rotation. Other service managers need stderr capture configured; Windows Event Log does not automatically collect stderr.
+
 ## TODO List
 - Status statistics function
   - Connection times, total, total data transmission volume, top-level IP access, top-level IP rejection, and other information statistics and display (command line)
@@ -118,3 +120,18 @@ journalctl -u meteor -f
 - Threat intelligence bridging
   - download
   - Upload
+
+## Development
+
+Requires Go 1.27.2 or later.
+
+```shell
+go mod download
+go test -race ./...
+go vet ./...
+go build ./...
+```
+
+Configuration is a single, strictly validated YAML document. Unknown fields, invalid IP rules, unsupported protocols, missing HTTPS certificates, and authentication without accounts prevent startup. City rules require `location.type: geoip` and a readable `location.file`; GeoIP initialization errors prevent startup. IP and city lists accept comma-separated values with surrounding whitespace. Rules are evaluated in order; the first matching rule wins, and unmatched clients are allowed.
+
+Generated configuration listens on `127.0.0.1:8080` and forwards to `127.0.0.1:80`. Edit the listen address explicitly to expose it externally. Config files are created with mode `0600` and existing files are preserved. SOCKS5 supports TCP CONNECT, with optional username/password authentication.

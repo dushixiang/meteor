@@ -2,22 +2,20 @@ package meteor
 
 import (
 	"context"
-	"github.com/dushxiiang/meteor/internal/location"
-	"github.com/dushxiiang/meteor/pkg/logger"
+	"fmt"
 	"io"
 	"net"
 	"os"
-	"os/signal"
 	"strings"
+	"sync"
 
+	"github.com/dushxiiang/meteor/internal/location"
 	"github.com/kardianos/service"
-	"github.com/mitchellh/mapstructure"
-	"github.com/pkg/errors"
-	"github.com/spf13/viper"
+	"go.yaml.in/yaml/v3"
 )
 
 const Timeout int = 10
-const Version = "v0.1.0"
+const Version = "v0.2.0"
 
 type Config struct {
 	Forwarders []Forwarder    `yaml:"forwarders"`
@@ -30,28 +28,75 @@ type LocationConfig struct {
 	File string `yaml:"file"`
 }
 
-func readConfig(config string) (cfg *Config, err error) {
-	viper.SetConfigFile(config)
-	if err := viper.ReadInConfig(); err != nil {
-		//logger.L.Sugar().Warnf("read config err: %s", err.Error())
-		return &Config{}, nil
-	} else {
-		err := viper.Unmarshal(&cfg, func(decoderConfig *mapstructure.DecoderConfig) {
-			decoderConfig.TagName = "yaml"
-		})
-		if err != nil {
-			logger.L.Sugar().Errorf("unmarshal config err: %s", err.Error())
-			return nil, err
-		}
+func readConfig(path string) (*Config, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
 	}
-	for i := range cfg.Forwarders {
-		for j := range cfg.Forwarders[i].Rules {
-			if err := cfg.Forwarders[i].Rules[j].Init(); err != nil {
-				return nil, errors.Wrap(err, "failed parse forwarder rules")
+	defer file.Close()
+	var cfg Config
+	decoder := yaml.NewDecoder(file)
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("decode config: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("config must contain exactly one YAML document")
+	}
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+func (c *Config) validate() error {
+	if c.Location.Type != "" && c.Location.Type != "geoip" {
+		return fmt.Errorf("unsupported location type %q", c.Location.Type)
+	}
+	if c.Location.Type == "geoip" && c.Location.File == "" {
+		return fmt.Errorf("location.file is required")
+	}
+	for i := range c.Forwarders {
+		f := &c.Forwarders[i]
+		if f.Protocol != "tcp" && f.Protocol != "udp" {
+			return fmt.Errorf("forwarder %d: unsupported protocol %q", i, f.Protocol)
+		}
+		if _, _, err := net.SplitHostPort(preprocessingAddr(f.Addr)); f.Addr == "" || err != nil {
+			return fmt.Errorf("forwarder %d: invalid listen address %q", i, f.Addr)
+		}
+		if host, port, err := net.SplitHostPort(f.To); err != nil || host == "" || port == "" {
+			return fmt.Errorf("forwarder %d: invalid target %q", i, f.To)
+		}
+		for j := range f.Rules {
+			if err := f.Rules[j].Init(); err != nil {
+				return fmt.Errorf("forwarder %d rule %d: %w", i, j, err)
+			}
+			if f.Rules[j].City != "" && c.Location.Type != "geoip" {
+				return fmt.Errorf("forwarder %d: city rules require geoip location", i)
 			}
 		}
 	}
-	return cfg, nil
+	for i, p := range c.Proxies {
+		if p.Protocol != "http" && p.Protocol != "https" && p.Protocol != "socks5" {
+			return fmt.Errorf("proxy %d: unsupported protocol %q", i, p.Protocol)
+		}
+		if _, _, err := net.SplitHostPort(preprocessingAddr(p.Addr)); p.Addr == "" || err != nil {
+			return fmt.Errorf("proxy %d: invalid listen address %q", i, p.Addr)
+		}
+		if p.Protocol == "https" && (p.Cert == "" || p.Key == "") {
+			return fmt.Errorf("proxy %d: HTTPS requires cert and key", i)
+		}
+		if p.Auth && len(p.Accounts) == 0 {
+			return fmt.Errorf("proxy %d: auth requires accounts", i)
+		}
+		for _, a := range p.Accounts {
+			if a.Username == "" || a.Password == "" {
+				return fmt.Errorf("proxy %d: empty credentials", i)
+			}
+		}
+	}
+	return nil
 }
 
 func New(config string) (*Meteor, error) {
@@ -64,8 +109,15 @@ func New(config string) (*Meteor, error) {
 		ctx:    ctx,
 		cancel: cancel,
 		cfg:    cfg,
-		quit:   make(chan struct{}),
 	}
+	if cfg.Location.Type == "geoip" {
+		meteor.Location, err = location.NewGeoIPLocation(cfg.Location.File)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("initialize location: %w", err)
+		}
+	}
+
 	return &meteor, nil
 }
 
@@ -74,77 +126,58 @@ type Meteor struct {
 	cancel context.CancelFunc
 	cfg    *Config
 
-	Location location.Location
-	quit     chan struct{}
+	Location  location.Location
+	workers   sync.WaitGroup
+	done      chan struct{}
+	startOnce sync.Once
 }
 
-func (r *Meteor) Start(s service.Service) error {
-	go r.Run()
-	return nil
-}
-
-func (r *Meteor) Run() {
-	forwarders := r.cfg.Forwarders
-	for i := range forwarders {
-		go forwarders[i].Forward(r.ctx, r.Location)
-	}
-
-	proxies := r.cfg.Proxies
-	for i := range proxies {
-		go proxies[i].Run(r.ctx)
-	}
-
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
-	select {
-	case <-interrupt:
-		close(r.quit)
-	case <-r.quit:
-		r.cancel()
-	}
-}
-
-func (r *Meteor) Stop(s service.Service) error {
-	close(r.quit)
-	return nil
-}
-
-func (r *Meteor) InitLocationService() error {
-	locationConfig := r.cfg.Location
-	switch locationConfig.Type {
-	case "geoip":
-		ipLocation, err := location.NewGeoIPLocation(locationConfig.File)
-		if err != nil {
-			return err
+func (r *Meteor) start() {
+	r.startOnce.Do(func() {
+		r.done = make(chan struct{})
+		for i := range r.cfg.Forwarders {
+			r.workers.Go(func() { r.cfg.Forwarders[i].Forward(r.ctx, r.Location) })
 		}
-		r.Location = ipLocation
-	}
+		for i := range r.cfg.Proxies {
+			r.workers.Go(func() { r.cfg.Proxies[i].Run(r.ctx) })
+		}
+		go func() {
+			<-r.ctx.Done()
+			r.workers.Wait()
+			if closer, ok := r.Location.(io.Closer); ok {
+				_ = closer.Close()
+			}
+			close(r.done)
+		}()
+	})
+}
+
+func (r *Meteor) Start(service.Service) error { r.start(); return nil }
+
+func (r *Meteor) Stop(service.Service) error {
+	r.cancel()
+	r.start()
+	<-r.done
 	return nil
 }
 
-type ConnCopier struct {
-	User, Backend io.ReadWriter
-}
-
-func (c ConnCopier) CopyFromBackend(errc chan<- error) {
-	_, err := io.Copy(c.User, c.Backend)
-	errc <- err
-}
-
-func (c ConnCopier) CopyToBackend(errc chan<- error) {
-	_, err := io.Copy(c.Backend, c.User)
-	errc <- err
-}
-
-func mutualCopyIO(conn0, conn1 net.Conn) {
-	var cc = ConnCopier{
-		User:    conn0,
-		Backend: conn1,
+// relay waits for both directions and preserves TCP half-close semantics.
+func relay(left, right net.Conn, leftReader io.Reader) {
+	defer left.Close()
+	defer right.Close()
+	done := make(chan struct{})
+	copyStream := func(dst, src net.Conn, reader io.Reader) {
+		_, err := io.Copy(dst, reader)
+		if tcp, ok := dst.(interface{ CloseWrite() error }); ok && err == nil {
+			_ = tcp.CloseWrite()
+		} else {
+			_ = dst.Close()
+			_ = src.Close()
+		}
 	}
-	var errc = make(chan error, 1)
-	go cc.CopyFromBackend(errc)
-	go cc.CopyToBackend(errc)
-	<-errc
+	go func() { copyStream(right, left, leftReader); close(done) }()
+	copyStream(left, right, right)
+	<-done
 }
 
 func preprocessingAddr(addr string) string {

@@ -9,15 +9,18 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Show version",
 	Run: func(cmd *cobra.Command, args []string) {
-		println(meteor.Version)
+		cmd.Println(meteor.Version)
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(installCmd)
-	rootCmd.AddCommand(uninstallCmd)
-	rootCmd.AddCommand(startCmd)
-	rootCmd.AddCommand(stopCmd)
-	rootCmd.AddCommand(restartCmd)
+	for _, action := range []string{"uninstall", "start", "stop", "restart"} {
+		rootCmd.AddCommand(&cobra.Command{
+			Use:   action,
+			Short: action + " meteor system service",
+			RunE:  func(cmd *cobra.Command, args []string) error { return control(config, cmd.Name()) },
+		})
+	}
 }

@@ -1,7 +1,8 @@
 package meteor
 
 import (
-	"github.com/dushxiiang/meteor/pkg/logger"
+	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 )
@@ -18,8 +19,12 @@ type Rule struct {
 }
 
 func (r *Rule) Init() error {
+	r.ipList = nil
+	r.cidrList = nil
+	r.cityList = nil
 	parts := strings.Split(r.IP, ",")
 	for _, part := range parts {
+		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
@@ -31,28 +36,34 @@ func (r *Rule) Init() error {
 			r.cidrList = append(r.cidrList, cidr)
 		} else {
 			addr := net.ParseIP(part)
+			if addr == nil {
+				return fmt.Errorf("invalid IP address %q", part)
+			}
 			r.ipList = append(r.ipList, addr)
 		}
 	}
 
 	if r.City != "" {
-		r.cityList = strings.Split(r.City, ",")
+		for _, city := range strings.Split(r.City, ",") {
+			if city = strings.TrimSpace(city); city != "" {
+				r.cityList = append(r.cityList, city)
+			}
+		}
 	}
 	return nil
 }
 
 func (r *Rule) MatchIP(x net.IP) bool {
-	sugar := logger.L.Sugar()
 	for _, addr := range r.ipList {
 		b := addr.Equal(x)
-		sugar.Debugf("Matching ip: %v equal %v = %v", addr, x, b)
+		slog.Debug("matching IP", "rule_ip", addr, "client_ip", x, "matched", b)
 		if b {
 			return true
 		}
 	}
 	for _, cidr := range r.cidrList {
 		b := cidr.Contains(x)
-		sugar.Debugf("Matching cidr: %v contains %v = %v", cidr, x, b)
+		slog.Debug("matching CIDR", "cidr", cidr, "client_ip", x, "matched", b)
 		if b {
 			return true
 		}
@@ -61,11 +72,10 @@ func (r *Rule) MatchIP(x net.IP) bool {
 }
 
 func (r *Rule) MatchCity(names map[string]string) bool {
-	sugar := logger.L.Sugar()
 	for _, name := range names {
 		for _, city := range r.cityList {
 			b := strings.EqualFold(city, name)
-			sugar.Debugf("Matching city: %v equal %v = %v", city, name, b)
+			slog.Debug("matching city", "rule_city", city, "city", name, "matched", b)
 			if b {
 				return true
 			}

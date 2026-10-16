@@ -1,11 +1,10 @@
 package cmd
 
 import (
-	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/dushxiiang/meteor/internal/meteor"
-	"github.com/dushxiiang/meteor/pkg/logger"
 
 	"github.com/spf13/cobra"
 )
@@ -16,21 +15,31 @@ var (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "meteor",
-	Short: "Meteor is a network tool that can quickly forward tcp and udp ports and start http, https and socks5 proxy servers.",
-	Run: func(cmd *cobra.Command, args []string) {
-		logger.Init(debug)
+	Use:           "meteor",
+	Short:         "Meteor is a network tool that can quickly forward tcp and udp ports and start http, https and socks5 proxy servers.",
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		level := slog.LevelInfo
 		if debug {
-			logger.L.Sugar().Debug("Current processing debug mode")
+			level = slog.LevelDebug
+		}
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if debug {
+			slog.Debug("debug logging enabled")
 		}
 		m, err := meteor.New(config)
 		if err != nil {
-			logger.L.Sugar().Fatal(err)
+			return err
 		}
-		if err := m.InitLocationService(); err != nil {
-			logger.L.Sugar().Warn(err)
+		srv, err := getService(config, m)
+		if err != nil {
+			_ = m.Stop(nil)
+			return err
 		}
-		m.Run()
+		return srv.Run()
 	},
 }
 
@@ -38,7 +47,7 @@ func Execute() {
 	rootCmd.PersistentFlags().StringVarP(&config, "config", "c", "/etc/meteor/meteor.yaml", "-c /path/config.yaml")
 	rootCmd.PersistentFlags().BoolVarP(&debug, "debug", "d", false, "print debug log")
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Println(err)
+		slog.Error("command failed", "error", err)
 		os.Exit(1)
 	}
 }

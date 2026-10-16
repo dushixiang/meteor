@@ -1,30 +1,25 @@
 package cmd
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-
-	"github.com/dushxiiang/meteor/internal/meteor"
-	"github.com/dushxiiang/meteor/pkg/logger"
 
 	"github.com/kardianos/service"
 	"github.com/spf13/cobra"
 )
 
 var defaultConfig = `
-//geoip:
-//  file: /etc/meteor/GeoLite2-City.mmdb
+#location:
+#  type: geoip
+#  file: /etc/meteor/GeoLite2-City.mmdb
 forwarders:
   - protocol: tcp
-    addr: ":8080"
+    addr: "127.0.0.1:8080"
     to: 127.0.0.1:80
     rules:
-      - city: beijing,chengdu
-        allowed: true
       - ip: 0.0.0.0/0
-        allowed: false
+        allowed: true
 #  - protocol: udp
 #    addr: ":54321"
 #    to: 127.0.0.1:12345
@@ -44,85 +39,53 @@ forwarders:
 `
 
 func createConfigIfNotExists(filePath, exampleConfig string) error {
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		dir := filepath.Dir(filePath)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return err
-		}
-
-		if err := os.WriteFile(filePath, []byte(exampleConfig), 0755); err != nil {
-			return err
-		}
-	} else if err != nil {
+	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
 		return err
 	}
-
-	return nil
+	file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if os.IsExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.WriteString(exampleConfig)
+	closeErr := file.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
 }
 
 var installCmd = &cobra.Command{
 	Use:   "install",
 	Short: "Install meteor as a system service",
-	Run: func(cmd *cobra.Command, args []string) {
-		logger.Init(debug)
+	RunE: func(cmd *cobra.Command, args []string) error {
 		err := createConfigIfNotExists(config, defaultConfig)
 		if err != nil {
-			logger.L.Sugar().Fatal("create config file", err)
+			return fmt.Errorf("create config file: %w", err)
 		}
-		control(config, cmd.Use)
+		return control(config, cmd.Name())
 	},
 }
 
-var uninstallCmd = &cobra.Command{
-	Use:   "uninstall",
-	Short: "Uninstall meteor system service",
-	Run: func(cmd *cobra.Command, args []string) {
-		logger.Init(debug)
-		control(config, cmd.Use)
-	},
-}
-
-var startCmd = &cobra.Command{
-	Use:   "start",
-	Short: "Start meteor system service",
-	Run: func(cmd *cobra.Command, args []string) {
-		logger.Init(debug)
-		control(config, cmd.Use)
-	},
-}
-
-var stopCmd = &cobra.Command{
-	Use:   "stop",
-	Short: "Stop meteor system service",
-	Run: func(cmd *cobra.Command, args []string) {
-		logger.Init(debug)
-		control(config, cmd.Use)
-	},
-}
-
-var restartCmd = &cobra.Command{
-	Use:   "restart",
-	Short: "Restart meteor system service",
-	Run: func(cmd *cobra.Command, args []string) {
-		logger.Init(debug)
-		control(config, cmd.Use)
-	},
-}
-
-func control(config, action string) {
-	srv, err := getService(config)
+func control(config, action string) error {
+	srv, err := getService(config, nil)
 	if err != nil {
-		fmt.Printf("err: %v\n", err)
-		return
+		return err
 	}
 	if err := service.Control(srv, action); err != nil {
-		fmt.Printf("%v\n", err)
-		return
+		return fmt.Errorf("%s service: %w", action, err)
 	}
-	fmt.Printf("success\n")
+	fmt.Println("success")
+	return nil
 }
 
-func getService(config string) (service.Service, error) {
+func getService(config string, program service.Interface) (service.Service, error) {
+	config, err := filepath.Abs(config)
+	if err != nil {
+		return nil, err
+	}
 	svcConfig := &service.Config{
 		Name:        "meteor",
 		DisplayName: "meteor service",
@@ -133,7 +96,8 @@ func getService(config string) (service.Service, error) {
 			"After=network-online.target syslog.target",
 		},
 		Option: service.KeyValue{
-			"Restart": "always",
+			"Restart":   "always",
+			"LogOutput": false,
 		},
 	}
 
@@ -141,9 +105,6 @@ func getService(config string) (service.Service, error) {
 		svcConfig.Arguments = append(svcConfig.Arguments, "-d")
 	}
 
-	prg, err := meteor.New(config)
-	if err != nil {
-		return nil, errors.New("error to new meteor, " + err.Error())
-	}
-	return service.New(prg, svcConfig)
+	// Service control must work even when the runtime configuration is invalid.
+	return service.New(program, svcConfig)
 }

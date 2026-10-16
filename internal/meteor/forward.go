@@ -2,16 +2,16 @@ package meteor
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/dushxiiang/meteor/internal/location"
-	"github.com/dushxiiang/meteor/pkg/logger"
 )
 
 var (
-	UDPPacketSize = 8 * 1024
+	UDPPacketSize = 65535
 	UDPTimeout    = time.Second * 30
 )
 
@@ -32,14 +32,17 @@ func (r *Forwarder) Forward(ctx context.Context, ipLocation location.Location) {
 }
 
 func (r *Forwarder) forwardTCP(ctx context.Context, ipLocation location.Location) {
-	sugar := logger.L.Sugar()
 	ln, err := net.Listen("tcp", preprocessingAddr(r.Addr))
 	if err != nil {
-		sugar.Error("error listening address", err)
+		slog.Error("TCP listen failed", "addr", r.Addr, "error", err)
 		return
 	}
 	defer ln.Close()
-	sugar.Infof("TCP forwarder started: %s -> %s", ln.Addr().String(), r.To)
+	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
+	defer stop()
+	var workers sync.WaitGroup
+	defer workers.Wait()
+	slog.Info("TCP forwarder started", "addr", ln.Addr(), "target", r.To)
 	for {
 		select {
 		case <-ctx.Done():
@@ -49,8 +52,10 @@ func (r *Forwarder) forwardTCP(ctx context.Context, ipLocation location.Location
 
 		conn, err := ln.Accept()
 		if err != nil {
-			sugar.Warn("error accept remoteConn", err)
-			continue
+			if ctx.Err() == nil {
+				slog.Warn("TCP accept failed", "addr", ln.Addr(), "error", err)
+			}
+			return
 		}
 		tcpAddr, ok := conn.RemoteAddr().(*net.TCPAddr)
 		if ok {
@@ -60,26 +65,22 @@ func (r *Forwarder) forwardTCP(ctx context.Context, ipLocation location.Location
 			}
 		}
 
-		sugar.Debugf("TCP client connected, %s <- %s", conn.LocalAddr(), conn.RemoteAddr())
-		go func() {
+		slog.Debug("TCP client connected", "local", conn.LocalAddr(), "remote", conn.RemoteAddr())
+		workers.Go(func() {
+			stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+			defer stop()
 			defer conn.Close()
-			backend, err := net.DialTimeout("tcp", r.To, time.Duration(Timeout)*time.Second)
+			backend, err := (&net.Dialer{Timeout: time.Duration(Timeout) * time.Second}).DialContext(ctx, "tcp", r.To)
 			if err != nil {
-				sugar.Errorf("forward to %s err: %v", r.To, err)
+				slog.Error("TCP upstream connection failed", "target", r.To, "error", err)
 				return
 			}
-			sugar.Debugf("Meteor TCP client connected, %s -> %s", backend.LocalAddr(), backend.RemoteAddr())
-			sugar.Debugf("Start mutual copy...")
-			mutualCopyIO(backend, conn)
-			sugar.Debugf("TCP client disconnected, %s <- %s", conn.LocalAddr(), conn.RemoteAddr())
-			sugar.Debugf("Meteor TCP client disconnected, %s -> %s", backend.LocalAddr(), backend.RemoteAddr())
-		}()
-	}
-}
-
-func NewUDPForwarder() *UDPForwarder {
-	return &UDPForwarder{
-		udpConnMap: make(map[string]*UDPConnWrap),
+			slog.Debug("TCP upstream connected", "local", backend.LocalAddr(), "remote", backend.RemoteAddr())
+			slog.Debug("TCP relay started")
+			relay(backend, conn, backend)
+			slog.Debug("TCP client disconnected", "local", conn.LocalAddr(), "remote", conn.RemoteAddr())
+			slog.Debug("TCP upstream disconnected", "local", backend.LocalAddr(), "remote", backend.RemoteAddr())
+		})
 	}
 }
 
@@ -112,28 +113,32 @@ func (r *UDPForwarder) Set(key string, conn *UDPConnWrap) {
 }
 
 func (r *Forwarder) forwardUDP(ctx context.Context, ipLocation location.Location) {
-	sugar := logger.L.Sugar()
 	src, err := net.ResolveUDPAddr("udp", preprocessingAddr(r.Addr))
 	if err != nil {
-		sugar.Error("error resolving local address", err)
+		slog.Error("UDP listen address resolution failed", "addr", r.Addr, "error", err)
 		return
 	}
 	dst, err := net.ResolveUDPAddr("udp", preprocessingAddr(r.To))
 	if err != nil {
-		sugar.Error("error resolving remote address", err)
+		slog.Error("UDP target resolution failed", "target", r.To, "error", err)
 		return
 	}
 
 	localConn, err := net.ListenUDP("udp", src)
 	if err != nil {
-		sugar.Error("error listening on local address", err)
+		slog.Error("UDP listen failed", "addr", src, "error", err)
 		return
 	}
 	defer localConn.Close()
+	stop := context.AfterFunc(ctx, func() { _ = localConn.Close() })
+	defer stop()
 
-	sugar.Infof("UDP forwarder started: %s -> %s", src, dst)
+	slog.Info("UDP forwarder started", "addr", localConn.LocalAddr(), "target", dst)
 
-	udpForwarder := NewUDPForwarder()
+	udpForwarder := &UDPForwarder{udpConnMap: make(map[string]*UDPConnWrap)}
+	var workers sync.WaitGroup
+	defer workers.Wait()
+	defer udpForwarder.Close()
 	buffer := make([]byte, UDPPacketSize)
 	for {
 		select {
@@ -144,7 +149,9 @@ func (r *Forwarder) forwardUDP(ctx context.Context, ipLocation location.Location
 		// 读取数据
 		n, clientAddr, err := localConn.ReadFromUDP(buffer)
 		if err != nil {
-			sugar.Warn("Error reading from UDP:", err)
+			if ctx.Err() == nil {
+				slog.Warn("UDP read failed", "addr", localConn.LocalAddr(), "error", err)
+			}
 			return
 		}
 
@@ -154,14 +161,14 @@ func (r *Forwarder) forwardUDP(ctx context.Context, ipLocation location.Location
 
 		udpConnWrap, ok := udpForwarder.Get(clientAddr.String())
 		if !ok {
-			sugar.Debugf("UDP client connected, %s <- %s", localConn.LocalAddr(), clientAddr)
+			slog.Debug("UDP client connected", "local", localConn.LocalAddr(), "remote", clientAddr)
 			// 创建远程UDP连接
 			remoteConn, err := net.DialUDP("udp", nil, dst)
 			if err != nil {
-				sugar.Warn("Error connecting to remote address:", err)
+				slog.Warn("UDP upstream connection failed", "target", dst, "error", err)
 				continue
 			}
-			sugar.Debugf("Meteor UDP client connected, %s -> %s", remoteConn.LocalAddr(), remoteConn.RemoteAddr())
+			slog.Debug("UDP upstream connected", "local", remoteConn.LocalAddr(), "remote", remoteConn.RemoteAddr())
 			udpConnWrap = &UDPConnWrap{
 				clientAddr: clientAddr,
 				localConn:  localConn,
@@ -169,16 +176,16 @@ func (r *Forwarder) forwardUDP(ctx context.Context, ipLocation location.Location
 			}
 			udpForwarder.Set(clientAddr.String(), udpConnWrap)
 
-			go func() {
+			workers.Go(func() {
 				defer udpForwarder.Del(clientAddr.String())
 				udpConnWrap.Loop()
-			}()
+			})
 		}
 
 		// 发送数据到远程地址
 		_, err = udpConnWrap.Write(buffer[:n])
 		if err != nil {
-			sugar.Warn("Error forwarding data:", err)
+			slog.Warn("UDP upstream write failed", "client", clientAddr, "target", dst, "error", err)
 			continue
 		}
 	}
@@ -201,25 +208,33 @@ func (r *UDPConnWrap) Write(data []byte) (int, error) {
 }
 
 func (r *UDPConnWrap) Loop() {
-	sugar := logger.L.Sugar()
 	defer func() {
-		sugar.Debugf("UDP client disconnected, %s <- %s", r.localConn.LocalAddr(), r.clientAddr)
-		sugar.Debugf("Meteor UDP client disconnected, %s -> %s", r.remoteConn.LocalAddr(), r.remoteConn.RemoteAddr())
+		slog.Debug("UDP client disconnected", "local", r.localConn.LocalAddr(), "remote", r.clientAddr)
+		slog.Debug("UDP upstream disconnected", "local", r.remoteConn.LocalAddr(), "remote", r.remoteConn.RemoteAddr())
 	}()
 
 	buffer := make([]byte, UDPPacketSize)
 	for {
 		n, err := r.Read(buffer)
 		if err != nil {
-			sugar.Warn("Error reading from remote UDP:", err)
+			slog.Warn("UDP upstream read failed", "target", r.remoteConn.RemoteAddr(), "error", err)
 			return
 		}
 
 		_, err = r.localConn.WriteToUDP(buffer[:n], r.clientAddr)
 		if err != nil {
-			sugar.Warn("Error forwarding data to local:", err)
+			slog.Warn("UDP client write failed", "client", r.clientAddr, "error", err)
 			return
 		}
 	}
 
+}
+
+func (r *UDPForwarder) Close() {
+	r.udpConnLock.Lock()
+	defer r.udpConnLock.Unlock()
+	for key, wrap := range r.udpConnMap {
+		_ = wrap.remoteConn.Close()
+		delete(r.udpConnMap, key)
+	}
 }

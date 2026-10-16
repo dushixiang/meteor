@@ -2,34 +2,39 @@ package meteor
 
 import (
 	"github.com/dushxiiang/meteor/internal/location"
-	"github.com/dushxiiang/meteor/pkg/logger"
+	"log/slog"
 	"net"
 )
 
 type RuleSet []Rule
 
 func (r RuleSet) Allowed(ip net.IP, ipLocation location.Location) bool {
-	sugar := logger.L.Sugar()
+	var city map[string]string
+	var lookupErr error
+	var lookedUp bool
 	for _, rule := range r {
 		if rule.IP != "" {
 			if rule.MatchIP(ip) {
-				sugar.Debugf("Matching IP succeeded, allowed: %v", rule.Allowed)
+				slog.Debug("IP rule matched", "client_ip", ip, "allowed", rule.Allowed)
 				return rule.Allowed
 			}
 		}
 
 		if rule.City != "" {
 			if ipLocation == nil {
-				sugar.Warn("Matching city skip, ip location not configed")
+				slog.Warn("city rule skipped: location not configured", "client_ip", ip)
 				continue
 			}
-			city, err := ipLocation.City(ip)
-			if err != nil {
-				sugar.Warnf("Matching city err: %v", err)
+			if !lookedUp {
+				city, lookupErr = ipLocation.City(ip)
+				lookedUp = true
+			}
+			if lookupErr != nil {
+				slog.Warn("city lookup failed", "client_ip", ip, "error", lookupErr)
 				continue
 			}
 			if rule.MatchCity(city) {
-				sugar.Debugf("Matching city succeeded, allowed: %v", rule.Allowed)
+				slog.Debug("city rule matched", "client_ip", ip, "allowed", rule.Allowed)
 				return rule.Allowed
 			}
 		}

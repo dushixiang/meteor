@@ -107,6 +107,8 @@ meteor install -d
 journalctl -u meteor -f
 ```
 
+日志通过 Go 标准库 `log/slog` 以结构化文本格式输出到标准错误，程序不创建或轮转日志文件。使用 `-d` 开启调试日志。Linux systemd 默认将标准输出和标准错误收集到 journal，可用 `journalctl -u meteor -f` 实时查看，或用 `journalctl -u meteor -b` 查看本次启动后的日志；日志保留和轮转由 journald 管理。其他服务管理器需要配置标准错误收集，Windows Event Log 不会自动收集标准错误。
+
 ## TODO List
 - 状态统计功能
   - 连接次数，总数，总共传输数据量， 访问top级IP，拒绝top级IP 等信息统计及展示(命令行)
@@ -116,3 +118,18 @@ journalctl -u meteor -f
 - 威胁情报接入
   - 接入
   - 上传
+
+## 开发与配置校验
+
+需要 Go 1.27.2 或更高版本。
+
+```shell
+go mod download
+go test -race ./...
+go vet ./...
+go build ./...
+```
+
+配置文件必须是单个 YAML 文档，并进行严格校验。未知字段、非法 IP 规则、不支持的协议、HTTPS 缺少证书或私钥、开启认证却没有账户，都会导致启动失败。城市规则必须配置 `location.type: geoip` 和可读取的 `location.file`；GeoIP 数据库初始化失败会终止启动。IP 和城市列表支持用逗号分隔，忽略各项两侧空格。规则按顺序匹配，首个匹配规则生效，没有匹配规则时默认允许访问。
+
+安装时生成的配置监听 `127.0.0.1:8080`，转发到 `127.0.0.1:80`；对外开放时需要显式修改监听地址。配置文件以 `0600` 权限创建，已有文件不会覆盖。SOCKS5 支持 TCP CONNECT，可以选择开启用户名和密码认证。

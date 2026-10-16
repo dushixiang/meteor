@@ -1,8 +1,11 @@
 package location
 
 import (
-	"github.com/oschwald/geoip2-golang"
+	"fmt"
 	"net"
+	"net/netip"
+
+	"github.com/oschwald/geoip2-golang/v2"
 )
 
 func NewGeoIPLocation(file string) (Location, error) {
@@ -21,11 +24,18 @@ type geoIPLocation struct {
 }
 
 func (r geoIPLocation) City(ip net.IP) (map[string]string, error) {
-	city, err := r.ipdb.City(ip)
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return nil, fmt.Errorf("invalid IP address %v", ip)
+	}
+	city, err := r.ipdb.City(addr.Unmap())
 	if err != nil {
 		return nil, err
 	}
-	return city.City.Names, err
+	names := city.City.Names
+	return map[string]string{"de": names.German, "en": names.English, "es": names.Spanish, "fr": names.French, "ja": names.Japanese, "pt-BR": names.BrazilianPortuguese, "ru": names.Russian, "zh-CN": names.SimplifiedChinese}, nil
 }
 
 var _ Location = (*geoIPLocation)(nil)
+
+func (r *geoIPLocation) Close() error { return r.ipdb.Close() }
